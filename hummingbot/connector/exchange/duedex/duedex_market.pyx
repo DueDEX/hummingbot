@@ -113,6 +113,7 @@ cdef class DuedexMarket(ExchangeBase):
         self._async_scheduler = AsyncCallScheduler(call_interval=0.5)
         self._ev_loop = asyncio.get_event_loop()
         self._duedex_auth = DuedexAuth(api_key=duedex_api_key, secret_key=duedex_secret_key)
+        self._account_cached_balances = {}
         self._in_flight_orders = {}
         self._last_poll_timestamp = 0
         self._last_timestamp = 0
@@ -195,15 +196,19 @@ cdef class DuedexMarket(ExchangeBase):
         self._stop_network()
         self._order_book_tracker.start()
         self._trading_rules_polling_task = safe_ensure_future(self._trading_rules_polling_loop())
-        self._user_stream_event_listener_task = safe_ensure_future(self._user_stream_event_listener())
         if self._trading_required:
             self._status_polling_task = safe_ensure_future(self._status_polling_loop())
+            self._user_stream_event_listener_task = safe_ensure_future(self._user_stream_event_listener())
+            self._user_stream_tracker_task = safe_ensure_future(self._user_stream_tracker.start())
 
     def _stop_network(self):
         self._order_book_tracker.stop()
         if self._status_polling_task is not None:
             self._status_polling_task.cancel()
             self._status_polling_task = None
+        if self._user_stream_tracker_task is not None:
+            self._user_stream_tracker_task.cancel()
+            self._user_stream_tracker_task = None
         if self._trading_rules_polling_task is not None:
             self._trading_rules_polling_task.cancel()
             self._trading_rules_polling_task = None
@@ -459,7 +464,7 @@ cdef class DuedexMarket(ExchangeBase):
                                        f"order {tracked_order.client_order_id}.")
                     self.c_trigger_event(self.MARKET_ORDER_FILLED_EVENT_TAG, order_filled_event)
 
-                self.logger().info(f"Order update response - {tracked_order.last_state}, is_open:{tracked_order.is_open}, is_done:{tracked_order.is_done}.")
+                # self.logger().info(f"Order update response - {tracked_order.last_state}, is_open:{tracked_order.is_open}, is_done:{tracked_order.is_done}.")
                 if tracked_order.is_open:
                     continue
 
@@ -632,12 +637,11 @@ cdef class DuedexMarket(ExchangeBase):
             str exchange_order_id
             object tracked_order
 
-        if order_type is OrderType.LIMIT or order_type is OrderType.LIMIT_MAKER:
-            decimal_amount = self.c_quantize_order_amount(trading_pair, amount)
-            decimal_price = self.c_quantize_order_price(trading_pair, price)
-            if decimal_amount < trading_rule.min_order_size:
-                raise ValueError(f"Buy order amount {decimal_amount} is lower than the minimum order size "
-                                 f"{trading_rule.min_order_size}.")
+        decimal_amount = self.c_quantize_order_amount(trading_pair, amount)
+        decimal_price = self.c_quantize_order_price(trading_pair, price)
+        if decimal_amount < trading_rule.min_order_size:
+            raise ValueError(f"Buy order amount {decimal_amount} is lower than the minimum order size "
+                             f"{trading_rule.min_order_size}.")
         try:
             exchange_order_id = await self.place_order(order_id, trading_pair, decimal_amount, True, order_type, decimal_price)
             self.c_start_tracking_order(
@@ -773,12 +777,12 @@ cdef class DuedexMarket(ExchangeBase):
             error_code = e.error_payload.get("code")
             if error_code == 10056:
                 # order not found
-                self.c_stop_tracking_order(tracked_order.client_order_id)
+                # self.c_stop_tracking_order(tracked_order.client_order_id)
                 self.logger().info(f"The order {tracked_order.client_order_id} has been cancelled according"
                                    f" to order status API. error_code - {error_code}")
-                self.c_trigger_event(self.MARKET_ORDER_CANCELLED_EVENT_TAG,
-                                     OrderCancelledEvent(self._current_timestamp,
-                                                         tracked_order.client_order_id))
+                # self.c_trigger_event(self.MARKET_ORDER_CANCELLED_EVENT_TAG,
+                #                      OrderCancelledEvent(self._current_timestamp,
+                #                                          tracked_order.client_order_id))
             else:
                 self.logger().network(
                     f"Failed to cancel order {order_id}: {str(e)}",
@@ -931,22 +935,23 @@ cdef class DuedexMarket(ExchangeBase):
         self._account_available_balances.update({asset_name: Decimal(cached_data["available"])})
 
     def _on_order_update(self, data):
-        order_id = data["orderId"]
         client_order_id = data["clientOrderId"]
         trading_pair = data["instrument"]
-        order_status = data["status"]
 
         tracked_order = self._in_flight_orders.get(client_order_id, None)
         if tracked_order is None:
             return
 
-        order_type = data["type"]
+        order_id = data.get("orderId", tracked_order.exchange_order_id)
+        order_type = data.get("type", tracked_order.order_type.name)
+        order_status = data.get("status", tracked_order.last_state)
         execute_amount_diff = s_decimal_0
-        execute_price = Decimal(data["fillPrice"])
-        new_confirmed_amount = Decimal(data["filledSize"])
-        execute_amount_diff = Decimal(new_confirmed_amount - tracked_order.executed_amount_base)
-        tracked_order.executed_amount_base = new_confirmed_amount
-        tracked_order.executed_amount_quote += Decimal(execute_amount_diff * execute_price)  # isInverse?
+        if "fillPrice" in data and "filledSize" in data:
+            execute_price = Decimal(data["fillPrice"])
+            new_confirmed_amount = Decimal(data["filledSize"])
+            execute_amount_diff = Decimal(new_confirmed_amount - tracked_order.executed_amount_base)
+            tracked_order.executed_amount_base = new_confirmed_amount
+            tracked_order.executed_amount_quote += Decimal(execute_amount_diff * execute_price)  # isInverse?
 
         if execute_amount_diff > s_decimal_0:
             self.logger().info(f"Filed {execute_amount_diff} out of {tracked_order.amount} of order "

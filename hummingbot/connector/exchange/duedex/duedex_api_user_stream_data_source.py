@@ -1,11 +1,15 @@
 #!/usr/bin/env python
-import aiohttp
 import asyncio
+import json
 import logging
+import time
 from typing import (
-    Optional,
+    Any,
     AsyncIterable,
+    Dict,
+    Optional,
 )
+import websockets
 
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.logger import HummingbotLogger
@@ -15,6 +19,10 @@ DUEDEX_WS_URI = "wss://feed.duedex.com/v1/feed"
 
 
 class DuedexAPIUserStreamDataSource(UserStreamTrackerDataSource):
+
+    MESSAGE_TIMEOUT = 30.0
+    PING_TIMEOUT = 10.0
+
     _user_logger: Optional[HummingbotLogger] = None
 
     @classmethod
@@ -25,103 +33,80 @@ class DuedexAPIUserStreamDataSource(UserStreamTrackerDataSource):
         return cls._user_logger
 
     def __init__(self, duedex_auth: DuedexAuth):
-        self._current_listen_key = None
-        self._current_endpoint = None
-        self._listen_for_user_steam_task = None
-        self._last_recv_time: float = 0
         self._auth: DuedexAuth = duedex_auth
-        self._client_session: aiohttp.ClientSession = None
-        self._websocket_connection: aiohttp.ClientWebSocketResponse = None
+        self._last_recv_time: float = 0
         super().__init__()
 
     @property
     def last_recv_time(self) -> float:
         return self._last_recv_time
 
-    async def _authenticate_client(self):
-        """
-        To authenticate, the client first sends a challenge message.
-        """
-        req = {"type": "challenge"}
-        await self._websocket_connection.send_json(req)
-        resp: aiohttp.WSMessage = await self._websocket_connection.receive()
-        msg = resp.json()
-        if "type" in msg and msg["type"] == "challenge":
-            req = self._auth.get_ws_signature_dict(msg['challenge'])
-            await self._websocket_connection.send_json(req)
-            resp: aiohttp.WSMessage = await self._websocket_connection.receive()
-            msg = resp.json()
-            if "type" in msg and msg["type"] == "auth":
-                self.logger().info("Successfully authenticated")
-                return
-        self.logger().error(f"Error occurred authenticating to websocket API server. {msg}")
-
-    async def _subscribe_topic(self, topic: str):
-        subscribe_request = {
-            "type": "subscribe",
-            "channels": [
-                {
-                    "name": topic,
-                }
-            ]
-        }
-        await self._websocket_connection.send_json(subscribe_request)
-
-    async def get_ws_connection(self) -> aiohttp.client._WSRequestContextManager:
-        if self._client_session is None:
-            self._client_session = aiohttp.ClientSession()
-
-        stream_url: str = f"{DUEDEX_WS_URI}"
-        return self._client_session.ws_connect(stream_url)
-
-    async def _socket_user_stream(self) -> AsyncIterable[str]:
-        """
-        Main iterator that manages the websocket connection.
-        """
-        while True:
-            raw_msg = await self._websocket_connection.receive()
-
-            if raw_msg.type != aiohttp.WSMsgType.TEXT:
-                continue
-
-            message = raw_msg.json()
-            # import sys
-            # print(f"MSG: {message}", file=sys.stdout)
-            yield message
+    async def _inner_messages(self, ws: websockets.WebSocketClientProtocol) -> AsyncIterable[str]:
+        # Terminate the recv() loop as soon as the next message timed out, so the outer loop can reconnect.
+        try:
+            while True:
+                try:
+                    msg: str = await asyncio.wait_for(ws.recv(), timeout=self.MESSAGE_TIMEOUT)
+                    self._last_recv_time = time.time()
+                    yield msg
+                except asyncio.TimeoutError:
+                    try:
+                        pong_waiter = await ws.ping()
+                        await asyncio.wait_for(pong_waiter, timeout=self.PING_TIMEOUT)
+                        self._last_recv_time = time.time()
+                    except asyncio.TimeoutError:
+                        raise
+        except asyncio.TimeoutError:
+            self.logger().warning("WebSocket ping timed out. Going to reconnect...")
+            return
+        except websockets.exceptions.ConnectionClosed:
+            return
+        finally:
+            await ws.close()
 
     async def listen_for_user_stream(self, ev_loop: asyncio.BaseEventLoop, output: asyncio.Queue):
-        while True:
-            try:
-                # Initialize Websocket Connection
-                async with (await self.get_ws_connection()) as ws:
-                    self._websocket_connection = ws
-
-                    # Authentication
-                    await self._authenticate_client()
-
-                    # Subscribe to Topic(s)
-                    await self._subscribe_topic("margins")
-                    await self._subscribe_topic("orders")
-                    # await self._subscribe_topic("executions")
-
-                    # Listen to WebSocket Connection
-                    async for message in self._socket_user_stream():
-                        if "type" in message:
-                            if message["type"] == "subscriptions":
-                                self.logger().info(f"Successfully subscribed to {message['channels']}.")
+        try:
+            while True:
+                try:
+                    async with websockets.connect(DUEDEX_WS_URI) as ws:
+                        ws: websockets.WebSocketClientProtocol = ws
+                        # To authenticate, the client first sends a challenge message.
+                        req: Dict[str, Any] = {"type": "challenge"}
+                        await ws.send(json.dumps(req))
+                        async for raw_msg in self._inner_messages(ws):
+                            msg: Dict[str, Any] = json.loads(raw_msg)
+                            if "type" in msg:
+                                if msg["type"] == "challenge":
+                                    req = self._auth.get_ws_signature_dict(msg['challenge'])
+                                    await ws.send(json.dumps(req))
+                                elif msg["type"] == "auth":
+                                    self.logger().info("Successfully authenticated")
+                                    # Subscribe to Topics
+                                    await ws.send(json.dumps({
+                                        "type": "subscribe",
+                                        "channels": [
+                                            {
+                                                "name": "margins",
+                                            },
+                                            {
+                                                "name": "orders",
+                                            }
+                                        ]
+                                    }))
+                                elif msg["type"] == "subscriptions":
+                                    for channel in msg["channels"]:
+                                        self.logger().info(f"Success to subscribe {channel}")
+                                elif msg["type"] in ["snapshot", "update"]:
+                                    output.put_nowait(msg)
+                                else:
+                                    self.logger().error(f"Unrecognized type received from Duedex websocket: {msg['type']}")
                             else:
-                                output.put_nowait(message)
-
-            except asyncio.CancelledError:
-                raise
-            except IOError as e:
-                self.logger().error(e, exc_info=True)
-            except Exception as e:
-                self.logger().error(f"Unexpected error occurred! {e}", exc_info=True)
-            finally:
-                if self._websocket_connection is not None:
-                    await self._websocket_connection.close()
-                    self._websocket_connection = None
-                if self._client_session is not None:
-                    await self._client_session.close()
-                    self._client_session = None
+                                self.logger().error(f"Unrecognized message received from Duedex websocket: {msg}")
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    self.logger().error("Unexpected error with WebSocket connection. Retrying after 5 seconds...",
+                                        exc_info=True)
+                    await asyncio.sleep(5)
+        finally:
+            pass
